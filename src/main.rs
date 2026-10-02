@@ -1,15 +1,19 @@
 use crossterm::{
-    cursor::MoveTo,
-    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+    cursor::{Hide, MoveTo, Show},
+    event::{
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste,
+        EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton,
+        MouseEvent, MouseEventKind,
+    },
     execute, queue,
-    style::Print,
+    style::{Color, Print, ResetColor, SetBackgroundColor, SetForegroundColor},
     terminal::{
-        self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen,
-        disable_raw_mode, enable_raw_mode,
+        self, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
     },
 };
 use std::io::{self, Write};
 
+/// Directions the cursor can be moved in.
 enum Move {
     Left,
     Right,
@@ -17,15 +21,92 @@ enum Move {
     Down,
 }
 
-struct Editor {
-    content: Vec<String>,
-    row: u16,
-    column: u16,       
-    height: u16,
+// ----------------------------------------------------------------------
+// Double-buffered screen
+// ----------------------------------------------------------------------
+
+/// One character cell in the screen buffer: glyph plus its colours.
+#[derive(Clone, Copy, PartialEq)]
+struct Cell {
+    ch: char,
+    fg: Color,
+    bg: Color,
+}
+
+impl Default for Cell {
+    fn default() -> Self {
+        Cell {
+            ch: ' ',
+            fg: Color::Reset,
+            bg: Color::Reset,
+        }
+    }
+}
+
+/// The last frame that was actually written to the terminal.
+///
+/// The renderer builds the *next* frame in memory and compares it against this
+/// buffer; only cells that differ are pushed to the terminal. This removes the
+/// full-screen clear that used to cause flicker.
+struct Screen {
     width: u16,
+    height: u16,
+    buffer: Vec<Cell>,
+}
+
+impl Screen {
+    fn new() -> Self {
+        Self {
+            width: 0,
+            height: 0,
+            buffer: Vec::new(),
+        }
+    }
+
+    /// Reallocate the buffer for a new terminal size.
+    ///
+    /// Every cell is marked invalid (`'\0'`) so the next render repaints the
+    /// whole screen instead of leaving stale glyphs behind.
+    fn resize(&mut self, w: u16, h: u16) {
+        if self.width == w && self.height == h {
+            return;
+        }
+        self.width = w;
+        self.height = h;
+        self.buffer = vec![
+            Cell {
+                ch: '\0',
+                fg: Color::Reset,
+                bg: Color::Reset,
+            };
+            (w as usize) * (h as usize)
+        ];
+    }
+}
+
+// ----------------------------------------------------------------------
+// Editor
+// ----------------------------------------------------------------------
+
+struct Editor {
+    /// One `String` per line. Always contains at least one line.
+    content: Vec<String>,
+    /// Cursor row (index into `content`).
+    row: u16,
+    /// Cursor column, counted in characters (not bytes).
+    column: u16,
+    /// Terminal width in columns.
+    width: u16,
+    /// Terminal height in rows.
+    height: u16,
+    /// First buffer row currently displayed.
     row_offset: u16,
+    /// First buffer column currently displayed.
     column_offset: u16,
+    /// Set when the screen needs to be repainted.
     dirty: bool,
+    /// Last frame written to the terminal.
+    screen: Screen,
 }
 
 impl Editor {
@@ -39,9 +120,32 @@ impl Editor {
             row_offset: 0,
             column_offset: 0,
             dirty: true,
+            screen: Screen::new(),
         }
     }
 
+    // ------------------------------------------------------------------
+    // Layout helpers
+    // ------------------------------------------------------------------
+
+    /// Width of the line-number gutter: digits of the largest line number
+    /// plus one separating space.
+    fn gutter_width(&self) -> u16 {
+        let digits = self.content.len().to_string().len() as u16;
+        digits + 1
+    }
+
+    /// Rows available for text (the last terminal row is the status bar).
+    fn text_height(&self) -> u16 {
+        self.height.saturating_sub(1)
+    }
+
+    /// Columns available for text (everything right of the gutter).
+    fn text_width(&self) -> u16 {
+        self.width.saturating_sub(self.gutter_width())
+    }
+
+    /// Number of characters in the line the cursor is on.
     fn current_line_len(&self) -> u16 {
         self.content
             .get(self.row as usize)
@@ -49,42 +153,120 @@ impl Editor {
             .unwrap_or(0)
     }
 
+    /// Byte offset of the `n`-th character in a line (`line.len()` if past end).
+    fn byte_at(line: &str, n: usize) -> usize {
+        line.char_indices()
+            .nth(n)
+            .map(|(i, _)| i)
+            .unwrap_or(line.len())
+    }
+
+    // ------------------------------------------------------------------
+    // Editing
+    // ------------------------------------------------------------------
+
+    /// Insert a character at the cursor and advance one column.
     fn insert_char(&mut self, c: char) {
         let row = self.row as usize;
         if row >= self.content.len() {
             return;
         }
-        let line = &mut self.content[row];
-        let col = (self.column as usize).min(line.chars().count());
-        let byte_idx = line
-            .char_indices()
-            .nth(col)
-            .map(|(i, _)| i)
-            .unwrap_or(line.len());
-        line.insert(byte_idx, c);
+        let col = (self.column as usize).min(self.content[row].chars().count());
+        let byte_idx = Self::byte_at(&self.content[row], col);
+        self.content[row].insert(byte_idx, c);
         self.column += 1;
         self.dirty = true;
+        self.ensure_visible();
     }
 
+    /// Split the current line at the cursor (Enter key).
     fn enter(&mut self) {
         let row = self.row as usize;
         if row >= self.content.len() {
             return;
         }
-        let line = &mut self.content[row];
-        let col = (self.column as usize).min(line.chars().count());
-        let byte_idx = line
-            .char_indices()
-            .nth(col)
-            .map(|(i, _)| i)
-            .unwrap_or(line.len());
-        let rest = line.split_off(byte_idx);
+        let col = (self.column as usize).min(self.content[row].chars().count());
+        let byte_idx = Self::byte_at(&self.content[row], col);
+        let rest = self.content[row].split_off(byte_idx);
         self.content.insert(row + 1, rest);
         self.row += 1;
         self.column = 0;
         self.dirty = true;
+        self.ensure_visible();
     }
 
+    /// Delete the character *before* the cursor (Backspace).
+    ///
+    /// At the start of a line the current line is appended to the previous
+    /// one, which is the behaviour every editor has.
+    fn backspace(&mut self) {
+        let row = self.row as usize;
+        if row >= self.content.len() {
+            return;
+        }
+        if self.column > 0 {
+            let col = self.column as usize;
+            let len = self.content[row].chars().count();
+            if col <= len {
+                let start = Self::byte_at(&self.content[row], col - 1);
+                let end = Self::byte_at(&self.content[row], col);
+                self.content[row].replace_range(start..end, "");
+                self.column -= 1;
+            }
+        } else if row > 0 {
+            // Join with the previous line.
+            let current = self.content.remove(row);
+            let prev_len = self.content[row - 1].chars().count() as u16;
+            self.content[row - 1].push_str(&current);
+            self.row -= 1;
+            self.column = prev_len;
+        }
+        self.dirty = true;
+        self.ensure_visible();
+    }
+
+    /// Delete the character *under* the cursor (Delete).
+    ///
+    /// At the end of a line the following line is appended to the current one.
+    fn delete(&mut self) {
+        let row = self.row as usize;
+        if row >= self.content.len() {
+            return;
+        }
+        let col = self.column as usize;
+        let len = self.content[row].chars().count();
+        if col < len {
+            let start = Self::byte_at(&self.content[row], col);
+            let end = Self::byte_at(&self.content[row], col + 1);
+            self.content[row].replace_range(start..end, "");
+        } else if row + 1 < self.content.len() {
+            let next = self.content.remove(row + 1);
+            self.content[row].push_str(&next);
+        }
+        self.dirty = true;
+        self.ensure_visible();
+    }
+
+    /// Paste a (possibly multi-line) string at the cursor.
+    ///
+    /// Newlines split the buffer; carriage returns are stripped so that both
+    /// Unix (`\n`) and Windows (`\r\n`) line endings work.
+    fn paste(&mut self, text: &str) {
+        let mut first = true;
+        for line in text.split('\n') {
+            if !first {
+                self.enter();
+            }
+            let line = line.trim_end_matches('\r');
+            for c in line.chars() {
+                self.insert_char(c);
+            }
+            first = false;
+        }
+        self.ensure_visible();
+    }
+
+    /// Move the cursor, clamping it into the buffer.
     fn move_cursor(&mut self, kind: Move, step: u16) {
         match kind {
             Move::Left => {
@@ -102,16 +284,37 @@ impl Editor {
                 self.row = self.row.saturating_add(step).min(max);
             }
         }
+        // A shorter line may leave the cursor past its end.
         let line_len = self.current_line_len();
         self.column = self.column.min(line_len);
 
         self.dirty = true;
+        self.ensure_visible();
     }
 
-    fn ensure_visible(&mut self) {
-        let height = self.height.max(1) as u32;
-        let width = self.width.max(1) as u32;
+    fn move_to_line_start(&mut self) {
+        self.column = 0;
+        self.dirty = true;
+        self.ensure_visible();
+    }
 
+    fn move_to_line_end(&mut self) {
+        self.column = self.current_line_len();
+        self.dirty = true;
+        self.ensure_visible();
+    }
+
+    // ------------------------------------------------------------------
+    // Scrolling
+    // ------------------------------------------------------------------
+
+    /// Scroll the viewport so that the cursor is visible.
+    ///
+    /// This is deliberately *not* called from `render`: mouse-wheel scrolling
+    /// must be able to move the viewport without snapping back to the cursor.
+    fn ensure_visible(&mut self) {
+        // Vertical scrolling.
+        let height = self.text_height().max(1) as u32;
         let row = self.row as u32;
         let max_offset = (self.content.len() as u32).saturating_sub(height);
         let mut offset = self.row_offset as u32;
@@ -124,6 +327,8 @@ impl Editor {
         offset = offset.min(max_offset);
         self.row_offset = offset as u16;
 
+        // Horizontal scrolling.
+        let width = self.text_width().max(1) as u32;
         let col = self.column as u32;
         let mut col_off = self.column_offset as u32;
 
@@ -138,89 +343,445 @@ impl Editor {
         self.column_offset = col_off as u16;
     }
 
+    // ------------------------------------------------------------------
+    // Mouse
+    // ------------------------------------------------------------------
+
+    /// Handle a mouse event. Selection is intentionally *not* supported:
+    /// dragging does nothing.
+    fn handle_mouse(&mut self, m: MouseEvent) {
+        match m.kind {
+            MouseEventKind::ScrollUp => {
+                // Pure viewport scroll; the cursor stays where it is.
+                self.row_offset = self.row_offset.saturating_sub(3);
+                self.dirty = true;
+            }
+            MouseEventKind::ScrollDown => {
+                let max = (self.content.len() as u16)
+                    .saturating_sub(self.text_height().max(1));
+                self.row_offset = (self.row_offset + 3).min(max);
+                self.dirty = true;
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                let status_row = self.height.saturating_sub(1);
+                if m.row >= status_row {
+                    return; // Click on the status bar: ignore.
+                }
+
+                let buf_row = (m.row + self.row_offset) as usize;
+                if buf_row >= self.content.len() {
+                    return;
+                }
+                self.row = buf_row as u16;
+
+                let gutter = self.gutter_width();
+                if m.column >= gutter {
+                    let buf_col = (m.column - gutter) as usize
+                        + self.column_offset as usize;
+                    let len = self.content[buf_row].chars().count();
+                    self.column = buf_col.min(len) as u16;
+                } else {
+                    self.column = 0;
+                }
+
+                self.dirty = true;
+                self.ensure_visible();
+            }
+            // Everything else (drags, right clicks, ...) is ignored.
+            _ => {}
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Drawing
+    // ------------------------------------------------------------------
+
     fn render(&mut self, stdout: &mut impl Write) -> io::Result<()> {
-        self.ensure_visible();
+        let width = self.width;
+        let height = self.height;
+        if width == 0 || height == 0 {
+            self.dirty = false;
+            return Ok(());
+        }
 
-        queue!(stdout, MoveTo(0, 0))?;
-        queue!(stdout, Clear(ClearType::All))?;
+        self.screen.resize(width, height);
 
-        let offset = self.row_offset as usize;
-        let height = self.height as usize;
-        let col_off = self.column_offset as usize;
-        let width = self.width as usize;
+        // ---- Build the next frame in memory -----------------------------
+        let mut frame = vec![Cell::default(); (width as usize) * (height as usize)];
 
+        let gutter = self.gutter_width() as usize;
+        let text_width = (width as usize).saturating_sub(gutter);
+        let text_height = self.text_height() as usize;
+        let row_offset = self.row_offset as usize;
+        let col_offset = self.column_offset as usize;
+
+        // Text area: line numbers + highlighted source.
         for (i, text) in self
             .content
             .iter()
             .enumerate()
-            .skip(offset)
-            .take(height)
+            .skip(row_offset)
+            .take(text_height)
         {
-            let screen_row = (i - offset) as u16;
-            let visible: String = text.chars().skip(col_off).take(width).collect();
-            queue!(stdout, MoveTo(0, screen_row))?;
-            queue!(stdout, Print(visible))?;
+            let y = i - row_offset;
+            let base = y * width as usize;
+
+            // Line number, right aligned inside the gutter.
+            let number = format!("{:>width$} ", i + 1, width = gutter - 1);
+            for (x, ch) in number.chars().enumerate() {
+                if x >= gutter {
+                    break;
+                }
+                frame[base + x] = Cell {
+                    ch,
+                    fg: Color::DarkGrey,
+                    bg: Color::Reset,
+                };
+            }
+
+            // Visible slice of the line, painted with shell colours.
+            let colors = tokenize_shell(text);
+            let chars: Vec<char> = text.chars().collect();
+            for (k, ch) in chars.iter().enumerate().skip(col_offset).take(text_width) {
+                let x = gutter + (k - col_offset);
+                frame[base + x] = Cell {
+                    ch: *ch,
+                    fg: colors.get(k).copied().flatten().unwrap_or(Color::Reset),
+                    bg: Color::Reset,
+                };
+            }
         }
 
-        let screen_row = self.row.saturating_sub(self.row_offset);
-        let screen_col = self.column.saturating_sub(self.column_offset);
-        queue!(stdout, MoveTo(screen_col, screen_row))?;
+        // Status bar on the very last row.
+        let status_y = (height - 1) as usize;
+        let status_base = status_y * width as usize;
+        let status = format!(
+            " shell | Ln {}, Col {} | {} lines | Ctrl-Q quit ",
+            self.row + 1,
+            self.column + 1,
+            self.content.len()
+        );
+        let mut bar: Vec<char> = status.chars().take(width as usize).collect();
+        while bar.len() < width as usize {
+            bar.push(' ');
+        }
+        for (x, ch) in bar.into_iter().enumerate() {
+            frame[status_base + x] = Cell {
+                ch,
+                fg: Color::Black,
+                bg: Color::White,
+            };
+        }
 
+        // ---- Flush only the cells that changed --------------------------
+        queue!(stdout, Hide)?;
+
+        let mut cur_fg = Color::Reset;
+        let mut cur_bg = Color::Reset;
+
+        for y in 0..height as usize {
+            for x in 0..width as usize {
+                let idx = y * width as usize + x;
+                if frame[idx] == self.screen.buffer[idx] {
+                    continue;
+                }
+                let cell = frame[idx];
+
+                // Always reposition: some glyphs (CJK, emoji) are double-width
+                // and would otherwise shift the cursor by two cells.
+                queue!(stdout, MoveTo(x as u16, y as u16))?;
+
+                if cell.fg != cur_fg {
+                    queue!(stdout, SetForegroundColor(cell.fg))?;
+                    cur_fg = cell.fg;
+                }
+                if cell.bg != cur_bg {
+                    queue!(stdout, SetBackgroundColor(cell.bg))?;
+                    cur_bg = cell.bg;
+                }
+                queue!(stdout, Print(cell.ch))?;
+            }
+        }
+
+        if cur_fg != Color::Reset || cur_bg != Color::Reset {
+            queue!(stdout, ResetColor)?;
+        }
+
+        // ---- Place the terminal cursor ----------------------------------
+        let cursor_visible = self.row >= self.row_offset
+            && (self.row - self.row_offset) < self.text_height()
+            && self.column >= self.column_offset;
+
+        if cursor_visible {
+            let cx = gutter as u16 + (self.column - self.column_offset);
+            let cy = self.row - self.row_offset;
+            if cx < width {
+                queue!(stdout, MoveTo(cx, cy))?;
+            } else {
+                queue!(stdout, MoveTo(width.saturating_sub(1), cy))?;
+            }
+        } else {
+            // Cursor scrolled out of view (mouse wheel): park it on the bar.
+            queue!(stdout, MoveTo(width.saturating_sub(1), height - 1))?;
+        }
+        queue!(stdout, Show)?;
+
+        self.screen.buffer = frame;
         self.dirty = false;
         stdout.flush()?;
         Ok(())
     }
 
+    /// Called when the terminal is resized.
     fn resize(&mut self, w: u16, h: u16) {
         self.width = w;
         self.height = h;
 
+        // Keep the cursor inside the buffer after the viewport shrank.
         let max_row = self.content.len().saturating_sub(1) as u16;
         self.row = self.row.min(max_row);
         let line_len = self.current_line_len();
         self.column = self.column.min(line_len);
+
+        // Clamp the scroll offset so we don't end up below the last line.
+        let max_off = (self.content.len() as u16).saturating_sub(self.text_height().max(1));
+        self.row_offset = self.row_offset.min(max_off);
 
         self.ensure_visible();
         self.dirty = true;
     }
 }
 
+// ----------------------------------------------------------------------
+// Minimal shell syntax highlighter
+// ----------------------------------------------------------------------
+
+/// Shell keywords (control-flow words, declarations, ...).
+const KEYWORDS: &[&str] = &[
+    "if", "then", "else", "elif", "fi", "for", "while", "until", "do", "done", "case",
+    "esac", "in", "function", "select", "time", "return", "break", "continue", "local",
+    "export", "readonly", "declare", "unset", "shift",
+];
+
+/// Common shell builtins / commands.
+const BUILTINS: &[&str] = &[
+    "echo", "cd", "pwd", "exit", "printf", "read", "test", "exec", "eval", "trap",
+    "kill", "wait", "jobs", "fg", "bg", "umask", "type", "hash", "help", "let",
+    "true", "false", "source", "alias", "set",
+];
+
+/// Characters that act as shell operators / redirections.
+fn is_operator(c: char) -> bool {
+    "|&;<>".contains(c)
+}
+
+/// Tokenize one line and return an optional colour for every character.
+///
+/// This is deliberately a *lightweight* lexer: it is not a full POSIX shell
+/// parser, it just recognises the constructs that matter visually.
+fn tokenize_shell(line: &str) -> Vec<Option<Color>> {
+    let chars: Vec<char> = line.chars().collect();
+    let mut colors: Vec<Option<Color>> = vec![None; chars.len()];
+    let mut i = 0;
+
+    while i < chars.len() {
+        let c = chars[i];
+
+        // --- Comment: '#' at the start of a word -----------------------
+        if c == '#' && (i == 0 || chars[i - 1].is_whitespace() || chars[i - 1] == ';') {
+            for slot in colors.iter_mut().skip(i) {
+                *slot = Some(Color::DarkGrey);
+            }
+            break;
+        }
+
+        // --- Single quoted string (no escapes inside) ------------------
+        if c == '\'' {
+            colors[i] = Some(Color::Green);
+            i += 1;
+            while i < chars.len() {
+                colors[i] = Some(Color::Green);
+                let closing = chars[i] == '\'';
+                i += 1;
+                if closing {
+                    break;
+                }
+            }
+            continue;
+        }
+
+        // --- Double quoted string (backslash escapes) ------------------
+        if c == '"' {
+            colors[i] = Some(Color::Green);
+            i += 1;
+            while i < chars.len() {
+                colors[i] = Some(Color::Green);
+                if chars[i] == '\\' && i + 1 < chars.len() {
+                    colors[i + 1] = Some(Color::Green);
+                    i += 2;
+                    continue;
+                }
+                let closing = chars[i] == '"';
+                i += 1;
+                if closing {
+                    break;
+                }
+            }
+            continue;
+        }
+
+        // --- Variables: $NAME, ${...}, $(...) --------------------------
+        if c == '$' {
+            colors[i] = Some(Color::Magenta);
+            i += 1;
+
+            if i < chars.len() && chars[i] == '{' {
+                let mut depth = 0;
+                while i < chars.len() {
+                    colors[i] = Some(Color::Magenta);
+                    if chars[i] == '{' {
+                        depth += 1;
+                    } else if chars[i] == '}' {
+                        depth -= 1;
+                        if depth == 0 {
+                            i += 1;
+                            break;
+                        }
+                    }
+                    i += 1;
+                }
+            } else if i < chars.len() && chars[i] == '(' {
+                let mut depth = 0;
+                while i < chars.len() {
+                    colors[i] = Some(Color::Magenta);
+                    if chars[i] == '(' {
+                        depth += 1;
+                    } else if chars[i] == ')' {
+                        depth -= 1;
+                        if depth == 0 {
+                            i += 1;
+                            break;
+                        }
+                    }
+                    i += 1;
+                }
+            } else {
+                while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
+                    colors[i] = Some(Color::Magenta);
+                    i += 1;
+                }
+            }
+            continue;
+        }
+
+        // --- Operators and redirections --------------------------------
+        if is_operator(c) {
+            colors[i] = Some(Color::Red);
+            i += 1;
+            continue;
+        }
+
+        // --- A plain word ----------------------------------------------
+        if !c.is_whitespace() {
+            let start = i;
+            while i < chars.len() {
+                let w = chars[i];
+                if w.is_whitespace()
+                    || w == '\''
+                    || w == '"'
+                    || w == '$'
+                    || w == '#'
+                    || is_operator(w)
+                {
+                    break;
+                }
+                i += 1;
+            }
+
+            let word: String = chars[start..i].iter().collect();
+            let color = if KEYWORDS.contains(&word.as_str()) {
+                Some(Color::Yellow)
+            } else if BUILTINS.contains(&word.as_str()) {
+                Some(Color::Cyan)
+            } else if word.starts_with('-') && word.len() > 1 {
+                // Command line option, e.g. -l or --verbose.
+                Some(Color::DarkYellow)
+            } else {
+                None
+            };
+
+            if let Some(color) = color {
+                for slot in colors.iter_mut().take(i).skip(start) {
+                    *slot = Some(color);
+                }
+            }
+            continue;
+        }
+
+        i += 1;
+    }
+
+    colors
+}
+
+// ----------------------------------------------------------------------
+// Entry point
+// ----------------------------------------------------------------------
+
 fn main() -> io::Result<()> {
     let mut stdout = io::stdout();
     enable_raw_mode()?;
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableBracketedPaste,
+    )?;
 
     let mut ed = Editor::new();
     let (w, h) = terminal::size()?;
     ed.width = w;
     ed.height = h;
-
+    ed.screen.resize(w, h);
     execute!(stdout,MoveTo(0,0))?;
+    ed.render(&mut stdout)?;
+
     loop {
         match event::read()? {
             Event::Key(k) if k.kind == KeyEventKind::Press => {
                 match k.code {
-                    KeyCode::Char('q')
-                        if k.modifiers.contains(KeyModifiers::CONTROL) =>
-                    {
+                    // Ctrl-Q quits.
+                    KeyCode::Char('q') if k.modifiers.contains(KeyModifiers::CONTROL) => {
                         break;
                     }
-                    KeyCode::Char(c)
-                        if !k.modifiers.contains(KeyModifiers::CONTROL) =>
-                    {
+                    // Plain characters are inserted into the buffer.
+                    KeyCode::Char(c) if !k.modifiers.contains(KeyModifiers::CONTROL) => {
                         ed.insert_char(c);
                     }
                     KeyCode::Enter => ed.enter(),
+                    KeyCode::Backspace => ed.backspace(),
+                    KeyCode::Delete => ed.delete(),
                     KeyCode::Up => ed.move_cursor(Move::Up, 1),
                     KeyCode::Down => ed.move_cursor(Move::Down, 1),
                     KeyCode::Left => ed.move_cursor(Move::Left, 1),
                     KeyCode::Right => ed.move_cursor(Move::Right, 1),
+                    KeyCode::Home => ed.move_to_line_start(),
+                    KeyCode::End => ed.move_to_line_end(),
+                    KeyCode::PageUp => {
+                        let step = ed.text_height().saturating_sub(1).max(1);
+                        ed.move_cursor(Move::Up, step);
+                    }
+                    KeyCode::PageDown => {
+                        let step = ed.text_height().saturating_sub(1).max(1);
+                        ed.move_cursor(Move::Down, step);
+                    }
                     _ => {}
                 }
             }
-            Event::Resize(w, h) => {
-                ed.resize(w, h);
-            }
+            Event::Mouse(m) => ed.handle_mouse(m),
+            // Bracketed paste: arrives as one event, newlines included.
+            Event::Paste(text) => ed.paste(&text),
+            Event::Resize(w, h) => ed.resize(w, h),
             _ => {}
         }
 
@@ -229,9 +790,16 @@ fn main() -> io::Result<()> {
         }
     }
 
+    execute!(
+        stdout,
+        Show,
+        DisableBracketedPaste,
+        DisableMouseCapture,
+        LeaveAlternateScreen,
+    )?;
     disable_raw_mode()?;
-    execute!(stdout, LeaveAlternateScreen)?;
 
+    // Dump the buffer to the real terminal after leaving the alt screen.
     for text in &ed.content {
         println!("{text}");
     }
