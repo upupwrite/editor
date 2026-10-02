@@ -29,6 +29,8 @@ struct Editor {
     column: u16,
     height: u16,
     wedth: u16,
+    row_offset: u16,
+    column_offset: u16,
     dirty: bool,
 }
 
@@ -40,6 +42,8 @@ impl Editor {
             column: 0,
             height: 0,
             wedth: 0,
+            row_offset: 0,
+            column_offset: 0,
             dirty: true,
         }
     }
@@ -69,32 +73,46 @@ impl Editor {
     fn enter(&mut self, stdout: &mut impl Write) -> io::Result<()> {
         self.content.push(String::new());
         self.row += 1;
-        queue!(stdout, MoveToNextLine(self.row));
+        if self.row >= self.height {
+            self.row_offset += 1;
+        }
+        queue!(stdout, MoveTo(self.row, 0));
         self.dirty = true;
         Ok(())
     }
     fn move_cursor(&mut self, stdout: &mut impl Write, kind: Move, step: u16) -> io::Result<()> {
         match kind {
-            Move::left => self.column=self.column.saturating_sub(step),
-            Move::right => self.column=self.column.saturating_add(step),
-            Move::up => self.row=self.row.saturating_sub(step),
-            Move::down => self.row=self.row.saturating_add(step),
+            Move::left => self.column = self.column.saturating_sub(step),
+            Move::right => self.column = self.column.saturating_add(step),
+            Move::up => self.row = self.row.saturating_sub(step),
+            Move::down => self.row = self.row.saturating_add(step),
         }
-        queue!(stdout,MoveTo(self.column,self.row))?;
+        queue!(stdout, MoveTo(self.column, self.row))?;
         Ok(())
     }
 
     fn render(&mut self, stdout: &mut impl Write) -> io::Result<()> {
         queue!(stdout, Clear(terminal::ClearType::All))?;
         for (row, text) in self.content.iter().enumerate() {
-            queue!(stdout, MoveTo(0,row as u16))?;
-            queue!(stdout, Print(text))?;
+            if row >= self.row_offset.into() {
+                let screen_row = (row - self.row_offset as usize) as u16;
+                queue!(stdout, MoveTo(0, screen_row))?;
+                queue!(stdout, Print(text))?;
+            }
         }
         self.dirty = false;
         stdout.flush()?;
         Ok(())
     }
 }
+
+//                            y(row)
+//                            ↑
+//                            |
+//                            |
+//                    --------+--------→ x(column)
+//                            |
+//                            |
 
 fn main() -> io::Result<()> {
     let mut stdout = io::stdout();
@@ -123,24 +141,23 @@ fn main() -> io::Result<()> {
                     ed.enter(&mut stdout)?;
                 }
                 match k.code {
-                    KeyCode::Down=>{
+                    KeyCode::Down => {
                         ed.move_cursor(&mut stdout, Move::down, 1)?;
                         stdout.flush()?;
                     }
-                    KeyCode::Up=>{
+                    KeyCode::Up => {
                         ed.move_cursor(&mut stdout, Move::up, 1)?;
                         stdout.flush()?;
                     }
-                    KeyCode::Left=>{
+                    KeyCode::Left => {
                         ed.move_cursor(&mut stdout, Move::left, 1)?;
                         stdout.flush()?;
                     }
-                    KeyCode::Right=>{
+                    KeyCode::Right => {
                         ed.move_cursor(&mut stdout, Move::right, 1)?;
                         stdout.flush()?;
                     }
-                   _=>{}
-                    
+                    _ => {}
                 }
             }
             _ => {}
